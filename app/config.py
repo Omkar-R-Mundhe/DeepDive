@@ -7,9 +7,14 @@ class ConfigurationError(RuntimeError):
     pass
 
 
-def get_required_setting(name: str) -> str:
+def get_setting(name: str, default: str) -> str:
     load_dotenv()
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        raise ConfigurationError(f"Required setting {name} is missing or empty.")
+    value = os.getenv(name, default)
     return value.strip()
+
+
+def get_required_setting(name: str) -> str:
+    value = get_setting(name, "")
+    if not value:
+        raise ConfigurationError(f"Required setting {name} is missing or empty.")
+    return value

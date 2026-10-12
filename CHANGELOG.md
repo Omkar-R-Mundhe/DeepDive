@@ -14,3 +14,5 @@
 - Preserved upstream Mesh error details in API responses while redacting the
   configured API key.
 - Kept credentials out of `.env.example`; local API keys belong in `.env`.
+- Tightened environment-file ignores and pushed the project to its dedicated
+  GitHub repository.

@@ -1,9 +1,18 @@
+import logging
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app import main
 from app.config import ConfigurationError
-from app.schemas.research import EvidenceRecord, ResearchPlan
+from app.schemas.research import (
+    EvidenceRecord,
+    ResearchClaim,
+    ResearchPlan,
+    ResearchRunResponse,
+    VerifiedClaim,
+    VerificationRecord,
+)
 from app.services.llm_client import LLMProviderError
 
 client = TestClient(main.app)
@@ -23,6 +32,27 @@ def test_ask_returns_model_answer(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"answer": "Answer to: Hello"}
+
+
+def test_request_logging_correlates_stages_without_logging_question(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(main, "ask_model", lambda _: "A private question's answer")
+    caplog.set_level(logging.INFO, logger="app")
+    private_question = "do not put this question in logs"
+
+    response = client.post(
+        "/api/v1/ask",
+        json={"question": private_question},
+    )
+
+    request_id = response.headers["X-Request-ID"]
+    log_output = caplog.text
+    assert request_id in log_output
+    assert "stage=api.ask event=started" in log_output
+    assert "event=request_completed" in log_output
+    assert private_question not in log_output
 
 
 def test_ask_rejects_blank_question() -> None:
@@ -149,3 +179,138 @@ def test_research_sources_reports_missing_brave_key(
     assert response.json() == {
         "detail": "Required setting BRAVE_SEARCH_API_KEY is missing or empty."
     }
+
+
+def test_draft_endpoint_returns_claims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = [
+        EvidenceRecord(
+            evidence_id="E-test123",
+            query="urban trees",
+            source_url="https://example.org/tree-study",
+            source_title="Urban tree study",
+            retrieved_at="2026-10-12T16:00:00+00:00",
+            passage="Tree cover can reduce local temperatures.",
+        )
+    ]
+    claim = ResearchClaim(
+        claim_id="C-test123",
+        claim_text="Tree cover can reduce local temperatures.",
+        evidence_ids=["E-test123"],
+        status="unverified",
+    )
+    monkeypatch.setattr(main, "draft_claims", lambda question, records: [claim])
+
+    response = client.post(
+        "/api/v1/claims/draft",
+        json={"question": "How does tree cover affect temperature?", "evidence": [
+            record.model_dump(mode="json") for record in evidence
+        ]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["claims"][0]["claim_id"] == "C-test123"
+    assert response.json()["claims"][0]["evidence_ids"] == ["E-test123"]
+
+
+def test_verify_endpoint_returns_verified_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = EvidenceRecord(
+        evidence_id="E-test123",
+        query="urban trees",
+        source_url="https://example.org/tree-study",
+        source_title="Urban tree study",
+        retrieved_at="2026-10-12T16:00:00+00:00",
+        passage="Tree cover can reduce local temperatures.",
+    )
+    claim = ResearchClaim(
+        claim_id="C-test123",
+        claim_text="Tree cover can reduce local temperatures.",
+        evidence_ids=["E-test123"],
+        status="unverified",
+    )
+    monkeypatch.setattr(
+        main,
+        "verify_claims",
+        lambda claims, records: [
+            VerifiedClaim(
+                claim=claims[0].model_copy(update={"status": "supported"}),
+                verification=VerificationRecord(
+                    claim_id="C-test123",
+                    verdict="supported",
+                    rationale="The passage directly states this.",
+                    evidence_ids=["E-test123"],
+                    checked_at="2026-10-12T16:00:00+00:00",
+                ),
+            )
+        ],
+    )
+
+    response = client.post(
+        "/api/v1/claims/verify",
+        json={
+            "claims": [claim.model_dump()],
+            "evidence": [evidence.model_dump(mode="json")],
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.json()["verifications"][0]
+    assert result["claim"]["status"] == "supported"
+    assert result["verification"]["evidence_ids"] == ["E-test123"]
+
+
+def test_research_run_endpoint_returns_combined_workflow_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = EvidenceRecord(
+        evidence_id="E-test123",
+        query="Research question",
+        source_url="https://example.org/source",
+        source_title="Research source",
+        retrieved_at="2026-10-13T16:00:00+00:00",
+        passage="A finding in the source.",
+    )
+    claim = ResearchClaim(
+        claim_id="C-test123",
+        claim_text="A finding in the source.",
+        evidence_ids=["E-test123"],
+        status="supported",
+    )
+    run = ResearchRunResponse(
+        question="Research question",
+        plan=ResearchPlan(
+            sub_questions=["Question one?", "Question two?", "Question three?"],
+            scope_boundaries=["Current evidence."],
+            recommended_source_types=["Research papers"],
+        ),
+        evidence=[evidence],
+        claims=[claim],
+        verifications=[
+            VerifiedClaim(
+                claim=claim,
+                verification=VerificationRecord(
+                    claim_id="C-test123",
+                    verdict="supported",
+                    rationale="The passage states the finding.",
+                    evidence_ids=["E-test123"],
+                    checked_at="2026-10-13T16:00:00+00:00",
+                ),
+            )
+        ],
+    )
+    monkeypatch.setattr(main, "run_research", lambda question, results_per_query: run)
+
+    response = client.post(
+        "/api/v1/research/run",
+        json={"question": "Research question", "results_per_query": 2},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["plan"]["sub_questions"][0] == "Question one?"
+    assert body["evidence"][0]["evidence_id"] == "E-test123"
+    assert body["claims"][0]["claim_id"] == "C-test123"
+    assert body["verifications"][0]["verification"]["verdict"] == "supported"

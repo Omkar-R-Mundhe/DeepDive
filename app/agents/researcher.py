@@ -1,56 +1,109 @@
+import logging
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from uuid import uuid4
 
 import httpx
 
-from app.config import get_required_setting
+from app.config import ConfigurationError, get_required_setting, get_setting
+from app.logging_utils import log_event, log_stage
 from app.schemas.research import EvidenceRecord
 
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
 
 class ResearchProviderError(RuntimeError):
     pass
 
 
+logger = logging.getLogger(__name__)
+
+
 def search_sources(query: str, count: int = 5) -> list[EvidenceRecord]:
-    api_key = get_required_setting("BRAVE_SEARCH_API_KEY")
-    try:
-        response = httpx.get(
-            BRAVE_SEARCH_URL,
-            headers={
-                "Accept": "application/json",
-                "X-Subscription-Token": api_key,
-            },
-            params={"q": query, "count": count},
-            timeout=15.0,
+    provider = get_setting("SEARCH_PROVIDER", "tavily").lower()
+    if provider not in {"brave", "tavily"}:
+        raise ConfigurationError(
+            "SEARCH_PROVIDER must be either 'brave' or 'tavily'."
         )
-        response.raise_for_status()
-        payload = response.json()
+
+    api_key_name = (
+        "TAVILY_API_KEY" if provider == "tavily" else "BRAVE_SEARCH_API_KEY"
+    )
+    with log_stage(logger, "search.configure", provider=provider):
+        api_key = get_required_setting(api_key_name)
+
+    try:
+        with log_stage(
+            logger,
+            "search.request",
+            provider=provider,
+            requested_count=count,
+        ):
+            if provider == "tavily":
+                response = httpx.post(
+                    TAVILY_SEARCH_URL,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                    json={
+                        "query": query,
+                        "max_results": count,
+                        "search_depth": "basic",
+                        "include_answer": False,
+                    },
+                    timeout=15.0,
+                )
+            else:
+                response = httpx.get(
+                    BRAVE_SEARCH_URL,
+                    headers={
+                        "Accept": "application/json",
+                        "X-Subscription-Token": api_key,
+                    },
+                    params={"q": query, "count": count},
+                    timeout=15.0,
+                )
+            response.raise_for_status()
+            payload = response.json()
     except httpx.HTTPStatusError as exc:
         details = exc.response.text[:1000]
         message = (
-            f"Brave Search returned HTTP {exc.response.status_code}: {details}"
+            f"{provider.title()} Search returned HTTP "
+            f"{exc.response.status_code}: {details}"
         )
         raise ResearchProviderError(message.replace(api_key, "[REDACTED]")) from exc
     except httpx.HTTPError as exc:
         message = str(exc).replace(api_key, "[REDACTED]")
-        raise ResearchProviderError(f"Brave Search request failed: {message}") from exc
+        raise ResearchProviderError(
+            f"{provider.title()} Search request failed: {message}"
+        ) from exc
     except ValueError as exc:
         raise ResearchProviderError(
-            "Brave Search returned invalid JSON."
+            f"{provider.title()} Search returned invalid JSON."
         ) from exc
 
-    if not isinstance(payload, dict):
-        raise ResearchProviderError("Brave Search returned an invalid response.")
+    with log_stage(logger, "search.parse_results", provider=provider):
+        if not isinstance(payload, dict):
+            raise ResearchProviderError(
+                f"{provider.title()} Search returned an invalid response."
+            )
 
-    web_results = payload.get("web", {})
-    if not isinstance(web_results, dict):
-        raise ResearchProviderError("Brave Search returned an invalid web result.")
-    results = web_results.get("results", [])
-    if not isinstance(results, list):
-        raise ResearchProviderError("Brave Search returned an invalid results list.")
+        if provider == "tavily":
+            results = payload.get("results", [])
+        else:
+            web_results = payload.get("web", {})
+            if not isinstance(web_results, dict):
+                raise ResearchProviderError(
+                    "Brave Search returned an invalid web result."
+                )
+            results = web_results.get("results", [])
+        if not isinstance(results, list):
+            raise ResearchProviderError(
+                f"{provider.title()} Search returned an invalid results list."
+            )
 
     retrieved_at = datetime.now(timezone.utc)
     evidence: list[EvidenceRecord] = []
@@ -60,7 +113,9 @@ def search_sources(query: str, count: int = 5) -> list[EvidenceRecord]:
 
         title = result.get("title")
         source_url = result.get("url")
-        passage = result.get("description")
+        passage = result.get(
+            "content" if provider == "tavily" else "description"
+        )
         if not all(isinstance(value, str) and value.strip() for value in (
             title,
             source_url,
@@ -85,7 +140,15 @@ def search_sources(query: str, count: int = 5) -> list[EvidenceRecord]:
 
     if not evidence:
         raise ResearchProviderError(
-            "Brave Search returned no results with usable source snippets."
+            f"{provider.title()} Search returned no results with usable source snippets."
         )
 
+    log_event(
+        logger,
+        "search.results",
+        "usable",
+        provider=provider,
+        received_count=len(results),
+        usable_count=len(evidence),
+    )
     return evidence

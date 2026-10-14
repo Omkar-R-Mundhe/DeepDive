@@ -212,9 +212,48 @@ class ResearchRunRequest(BaseModel):
     results_per_query: int = Field(default=3, ge=1, le=5)
 
 
+class ResearchReportSection(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    heading: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(max_length=20)
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def require_unique_evidence_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("Report evidence IDs must be unique.")
+        return values
+
+
+class ResearchReport(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    answer: str = Field(min_length=1)
+    sections: list[ResearchReportSection] = Field(min_length=1, max_length=8)
+
+
 class ResearchRunResponse(BaseModel):
     question: str
+    report: ResearchReport | None = None
     plan: ResearchPlan
     evidence: list[EvidenceRecord]
     claims: list[ResearchClaim]
     verifications: list[VerifiedClaim]
+
+
+class ResearchJobAccepted(BaseModel):
+    run_id: str
+    status: Literal["queued"]
+    status_url: str
+
+
+class ResearchJobStatus(BaseModel):
+    run_id: str
+    status: Literal["queued", "running", "completed", "failed"]
+    current_stage: str | None
+    error: str | None
+    created_at: datetime
+    updated_at: datetime
+    result: ResearchRunResponse | None

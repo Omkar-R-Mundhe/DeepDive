@@ -7,6 +7,8 @@ from app.schemas.research import (
     EvidenceRecord,
     ResearchClaim,
     ResearchPlan,
+    ResearchReport,
+    ResearchReportSection,
     ResearchRunResponse,
     VerifiedClaim,
     VerificationRecord,
@@ -54,6 +56,16 @@ def test_run_research_executes_and_combines_all_stages(
     )
     calls = []
     persisted = []
+    report = ResearchReport(
+        answer="The research supports this finding.",
+        sections=[
+            ResearchReportSection(
+                heading="Key finding",
+                body="The cited passage supports the finding.",
+                evidence_ids=["E-1"],
+            )
+        ],
+    )
 
     def fake_plan(question: str) -> ResearchPlan:
         calls.append(("plan", question))
@@ -81,16 +93,26 @@ def test_run_research_executes_and_combines_all_stages(
         calls.append(("verify", len(claims), len(evidence)))
         return [verified]
 
+    def fake_report(
+        question: str,
+        verified_claims: list[VerifiedClaim],
+        evidence: list[EvidenceRecord],
+    ) -> ResearchReport:
+        calls.append(("report", question, len(verified_claims), len(evidence)))
+        return report
+
     monkeypatch.setattr(research_workflow, "create_research_plan", fake_plan)
     monkeypatch.setattr(research_workflow, "search_sources", fake_search)
     monkeypatch.setattr(research_workflow, "save_evidence", fake_save)
     monkeypatch.setattr(research_workflow, "draft_claims", fake_draft)
     monkeypatch.setattr(research_workflow, "verify_claims", fake_verify)
+    monkeypatch.setattr(research_workflow, "write_research_report", fake_report)
 
     result = research_workflow.run_research("Research this", results_per_query=2)
 
     assert isinstance(result, ResearchRunResponse)
     assert result.question == "Research this"
+    assert result.report == report
     assert result.plan == plan
     assert result.evidence == [record for items in evidence_by_query.values() for record in items]
     assert result.claims == [claim]
@@ -104,6 +126,7 @@ def test_run_research_executes_and_combines_all_stages(
         ("persist", 3),
         ("draft", "Research this", 3),
         ("verify", 1, 3),
+        ("report", "Research this", 1, 3),
     ]
 
 

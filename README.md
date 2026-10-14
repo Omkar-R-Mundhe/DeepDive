@@ -6,22 +6,28 @@ against the source passages cited for them.
 ## Current milestone
 
 The API exposes separate planning, search, claim-drafting, and verification
-endpoints, plus `POST /api/v1/research/run` to execute those stages together.
+endpoints, plus `POST /api/v1/research/runs` to start those stages as a
+background job.
 The run endpoint creates a validated plan, searches each sub-question, stores
 the collected evidence in SQLite, drafts evidence-linked claims, verifies each
-claim against its attached passages, and returns the combined result.
+claim against its attached passages, and synthesizes the verified findings
+into a cited research answer. The UI presents the answer first and keeps the
+plan, source snippets, and claim-level checks in an expandable research trail.
 
 ## Workflow
 
 ```mermaid
 flowchart TD
-    Client["Client / API caller"]
+    Browser["User's browser"]
+    Frontend["React frontend<br/>question form, progress, results"]
+    Client["API caller / Swagger"]
     Ask["POST /api/v1/ask"]
     PlanEndpoint["POST /api/v1/plan"]
     Sources["POST /api/v1/research/sources"]
     Draft["POST /api/v1/claims/draft"]
     Verify["POST /api/v1/claims/verify"]
-    Run["POST /api/v1/research/run"]
+    Run["POST /api/v1/research/runs<br/>returns run_id"]
+    Poll["GET /api/v1/research/runs/{run_id}<br/>poll status/result"]
 
     Plan["Planner<br/>3–5 sub-questions<br/>scope and source types"]
     Search["Web search<br/>Tavily default / Brave optional"]
@@ -29,9 +35,14 @@ flowchart TD
     Store[("SQLite<br/>evidence only")]
     Drafter["Claim drafter<br/>claims linked to evidence IDs"]
     Verifier["Verifier<br/>supported / contradicted / insufficient"]
-    Result["Combined response<br/>plan, evidence, claims, verdicts"]
-    LLM["LLM provider<br/>Mesh default / Gemini dev option"]
+    Writer["Report writer<br/>synthesizes verified findings with citations"]
+    Result["Research answer<br/>with cited sections and expandable audit trail"]
+    LLM["LLM provider<br/>Mesh / Gemini / OpenRouter"]
 
+    Browser --> Frontend
+    Frontend -->|start run| Run
+    Frontend -->|poll every 2.5 seconds| Poll
+    Result --> Frontend
     Client --> Ask
     Ask --> LLM
     Client --> PlanEndpoint
@@ -53,14 +64,19 @@ flowchart TD
     Plan -->|each planned sub-question| Search
     Evidence --> Drafter
     Drafter --> Verifier
-    Verifier --> Result
+    Verifier --> Writer
+    Writer --> LLM
+    Writer --> Result
     Result --> Client
+    Run --> Poll
+    Poll --> Client
 ```
 
 Every API request gets a correlation ID and logs stage start, completion,
 duration, and failures. Slow LLM requests emit a heartbeat every 15 seconds.
 The workflow currently searches using snippets; it does not fetch full pages,
-retry weak evidence, persist claims/verdicts, or generate a narrative report.
+or retry weak evidence. The final narrative uses an additional LLM call after
+claim verification; claims and verdicts remain available in the audit trail.
 
 ## Setup
 
@@ -73,6 +89,32 @@ python -m pip install -r requirements-dev.txt
 python -m uvicorn app.main:app --reload
 ```
 
+### Run the web UI locally
+
+Run the backend in one PowerShell window using the command above. In a second
+window, from the project directory, start the React frontend:
+
+```powershell
+Set-Location .\frontend
+npm install
+npm run dev
+```
+
+Open the local URL printed by Vite (usually <http://localhost:5173>). The
+frontend submits research questions, polls the job status endpoint every 2.5
+seconds automatically, and displays a synthesized, evidence-cited answer.
+The underlying plan, source snippets, claims, and verdicts are available in a
+collapsed research trail. Vite proxies `/api` requests to the local FastAPI server.
+For a deployed frontend, set `VITE_API_BASE_URL` to the API base URL (for
+example, `https://api.example.com/api/v1`) at frontend build time and configure
+`FRONTEND_ORIGINS` in the backend `.env` to the deployed site's origin.
+
+Keeping `frontend/` in this repository is a normal monorepo setup and does not
+require deploying it with the API. Build and deploy the frontend independently
+as a static site (for example, with AWS Amplify Hosting or S3 + CloudFront), and
+deploy the FastAPI backend as a separate service. Configure the frontend API
+base URL and backend CORS origin for the deployed domains.
+
 Open <http://127.0.0.1:8000/docs> for the API documentation. The health
 endpoint is available at <http://127.0.0.1:8000/health> and returns
 `{"status":"ok"}`.
@@ -82,9 +124,10 @@ endpoint is available at <http://127.0.0.1:8000/health> and returns
 Uvicorn prints request and processing-stage logs to the terminal. Each request
 gets a correlation ID, returned in the `X-Request-ID` response header and
 included in its log lines. Follow that ID to see request start/completion,
-provider calls, planning, search and evidence persistence, claim drafting, and
-verification, including elapsed time and safe result counts. Failures include
-the failing stage and exception type. Prompts, questions, source passages,
+provider calls, planning, search and evidence persistence, claim drafting,
+verification, and report synthesis, including elapsed time and safe result
+counts. Failures include the failing stage and exception type. Prompts,
+questions, source passages,
 provider responses, and API keys are not included in stage logs.
 The app configures its own INFO-level console handler, so these stage logs are
 visible even when Uvicorn's logging configuration does not enable application
@@ -98,10 +141,16 @@ To try the Planner endpoint, send a JSON request such as
 
 To run the complete current pipeline in one call, send
 `{"question":"How does urban tree cover affect local temperatures?","results_per_query":3}`
-to `POST /api/v1/research/run`. `results_per_query` is optional and ranges from
-1 to 5. The response includes the generated plan, gathered evidence, drafted
-claims, and verification results. This endpoint does not yet synthesize a
-narrative report.
+to `POST /api/v1/research/runs`. The endpoint returns `202 Accepted` with a
+`run_id` and `status_url`. Poll that URL with `GET` to see the current stage;
+when status is `completed`, the response contains a synthesized `report` and
+the supporting plan, evidence, claims, and verifications under `result`. A
+failed run includes an `error` message.
+The frontend keeps the run ID internally for polling and does not display it.
+Provider failures are logged server-side while the frontend receives a concise,
+actionable message rather than raw upstream error details.
+`results_per_query` is optional and ranges from 1 to 5. The synchronous
+`POST /api/v1/research/run` endpoint remains available for direct API use.
 
 Search uses Tavily by default. Create an API key in the
 [Tavily dashboard](https://app.tavily.com), set `TAVILY_API_KEY` in `.env`, and
@@ -120,14 +169,17 @@ question, then pass the resulting claims and the same evidence records to
 `/api/v1/claims/verify`. The claim endpoints validate that model-generated
 evidence IDs refer only to records included in the request. Verification
 results are model assessments, not independent proof of factual truth.
-These claim endpoints currently accept evidence and claims in the request body;
-claims and verdicts are not yet persisted to SQLite. The combined research-run
-endpoint accepts a question and an optional `results_per_query` value (default
-3, maximum 5). A complete run makes one search call for each plan sub-question;
-if a search stage fails, the run stops before persisting partial evidence or
-drafting claims. Search evidence is still snippets rather than full-page
-content, and the endpoint does not yet retry weak claims or synthesize a final
-narrative report.
+These claim endpoints currently accept evidence and claims in the request body.
+Research job state and completed results are persisted in SQLite, along with
+the separately persisted evidence. The job runner currently runs in the API
+process rather than a durable external queue; interrupted queued/running jobs
+are marked failed when the service restarts. A complete run makes one search
+call for each plan sub-question; if a search stage fails, it stops before
+persisting partial search evidence or drafting claims. Search evidence is still
+snippets rather than full-page content, and the endpoint does not yet retry
+weak claims. The report writer synthesizes verified claim assessments into a
+readable answer and validates its source IDs against verifier-selected
+evidence; the model-generated synthesis is still an AI assessment, not proof.
 
 ## Tests
 
@@ -138,14 +190,16 @@ python -m pytest
 ## Configuration and secrets
 
 Copy `.env.example` to `.env` and add your provider's key. Set
-`LLM_PROVIDER=mesh` to use Mesh (the hackathon target), or set
-`LLM_PROVIDER=gemini` for temporary local testing with the Gemini API directly.
-Each provider has its own key and model settings; never reuse or relabel a
-provider key. Gemini-direct calls bypass Mesh and are for development testing
-only. The Gemini model should be one enabled for your key; the current local
-setup was verified with `gemini-3.8-flash`. The selected search provider uses
-its own key (`TAVILY_API_KEY` for Tavily or `BRAVE_SEARCH_API_KEY` for Brave),
-separate from the LLM key. Restart Uvicorn after
-changing `.env` so the app loads the selected provider and settings. Keep real
-keys in `.env` only—never put them in `.env.example` or source control. `.env`
-is ignored by Git.
+`LLM_PROVIDER=mesh` for Mesh (the hackathon target), `LLM_PROVIDER=gemini` for
+direct Gemini API testing, or `LLM_PROVIDER=openrouter` to use a model available
+in your OpenRouter account. OpenRouter uses its OpenAI-compatible API endpoint;
+set `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` to the key and exact model slug
+shown in your OpenRouter account/model catalog. Availability, speed, and
+pricing/quota depend on the selected model and upstream provider; enabling a
+different API gateway does not itself guarantee that model calls will succeed.
+Each integration has its own key and model settings; never reuse or relabel a
+provider key. The selected search provider uses its own key
+(`TAVILY_API_KEY` for Tavily or `BRAVE_SEARCH_API_KEY` for Brave), separate from
+the LLM key. Restart Uvicorn after changing `.env` so the app loads the
+selected provider and settings. Keep real keys in `.env` only—never put them in
+`.env.example` or source control. `.env` is ignored by Git.

@@ -7,6 +7,7 @@ from app.logging_utils import log_event, log_stage
 
 MESH_BASE_URL = "https://api.meshapi.ai/v1"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 class LLMProviderError(RuntimeError):
@@ -21,10 +22,15 @@ def ask_model(question: str) -> str:
     provider_settings = {
         "mesh": ("MESH_API_KEY", "MESH_MODEL", MESH_BASE_URL),
         "gemini": ("GEMINI_API_KEY", "GEMINI_MODEL", GEMINI_BASE_URL),
+        "openrouter": (
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_MODEL",
+            OPENROUTER_BASE_URL,
+        ),
     }
     if provider not in provider_settings:
         raise ConfigurationError(
-            "LLM_PROVIDER must be either 'mesh' or 'gemini'."
+            "LLM_PROVIDER must be 'mesh', 'gemini', or 'openrouter'."
         )
 
     try:
@@ -50,8 +56,28 @@ def ask_model(question: str) -> str:
         error_message = str(exc).replace(api_key, "[REDACTED]")
         raise LLMProviderError(error_message) from exc
 
-    if not response.choices or response.choices[0].message.content is None:
-        raise LLMProviderError(f"The {provider} API returned no answer.")
+    choices = response.choices
+    message = choices[0].message if choices else None
+    content = message.content if message is not None else None
+    if not isinstance(content, str) or not content.strip():
+        finish_reason = choices[0].finish_reason if choices else None
+        refusal_present = bool(getattr(message, "refusal", None))
+        tool_call_count = len(getattr(message, "tool_calls", None) or [])
+        log_event(
+            logger,
+            "llm.response",
+            "no_text",
+            provider=provider,
+            model=model,
+            choice_count=len(choices),
+            finish_reason=finish_reason or "unknown",
+            refusal_present=refusal_present,
+            tool_call_count=tool_call_count,
+        )
+        raise LLMProviderError(
+            f"The {provider} model '{model}' completed without returning text "
+            f"(finish_reason={finish_reason or 'unknown'})."
+        )
 
     log_event(logger, "llm.response", "received", provider=provider)
-    return response.choices[0].message.content
+    return content

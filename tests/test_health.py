@@ -9,6 +9,8 @@ from app.schemas.research import (
     EvidenceRecord,
     ResearchClaim,
     ResearchPlan,
+    ResearchReport,
+    ResearchReportSection,
     ResearchRunResponse,
     VerifiedClaim,
     VerificationRecord,
@@ -23,6 +25,20 @@ def test_health_returns_ok() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_frontend_origin_is_allowed_by_cors() -> None:
+    response = client.options(
+        "/api/v1/research/runs",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
 
 
 def test_ask_returns_model_answer(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -281,6 +297,16 @@ def test_research_run_endpoint_returns_combined_workflow_result(
     )
     run = ResearchRunResponse(
         question="Research question",
+        report=ResearchReport(
+            answer="A synthesized answer.",
+            sections=[
+                ResearchReportSection(
+                    heading="Finding",
+                    body="A verified finding.",
+                    evidence_ids=["E-test123"],
+                )
+            ],
+        ),
         plan=ResearchPlan(
             sub_questions=["Question one?", "Question two?", "Question three?"],
             scope_boundaries=["Current evidence."],
@@ -311,6 +337,47 @@ def test_research_run_endpoint_returns_combined_workflow_result(
     assert response.status_code == 200
     body = response.json()
     assert body["plan"]["sub_questions"][0] == "Question one?"
+    assert body["report"]["answer"] == "A synthesized answer."
     assert body["evidence"][0]["evidence_id"] == "E-test123"
     assert body["claims"][0]["claim_id"] == "C-test123"
     assert body["verifications"][0]["verification"]["verdict"] == "supported"
+
+
+def test_research_job_endpoint_returns_id_and_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queued_job = {
+        "run_id": "run-test123",
+        "status": "queued",
+        "current_stage": "Waiting to start",
+        "error": None,
+        "created_at": "2026-10-14T10:00:00+00:00",
+        "updated_at": "2026-10-14T10:00:00+00:00",
+        "result": None,
+    }
+    monkeypatch.setattr(main, "new_research_run_id", lambda: "run-test123")
+    monkeypatch.setattr(main, "create_research_run", lambda *args: None)
+    monkeypatch.setattr(main, "execute_research_job", lambda *args: None)
+    monkeypatch.setattr(main, "get_research_run", lambda run_id: queued_job)
+
+    response = client.post(
+        "/api/v1/research/runs",
+        json={"question": "Research question"},
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "run_id": "run-test123",
+        "status": "queued",
+        "status_url": "/api/v1/research/runs/run-test123",
+    }
+    status_response = client.get("/api/v1/research/runs/run-test123")
+    assert status_response.status_code == 200
+    assert status_response.json()["current_stage"] == "Waiting to start"
+
+
+def test_research_job_status_returns_404_for_unknown_run() -> None:
+    response = client.get("/api/v1/research/runs/not-found")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Research run not found."}

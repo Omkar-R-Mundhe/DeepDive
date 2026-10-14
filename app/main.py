@@ -1,39 +1,73 @@
 import logging
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
 from time import perf_counter
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.base import RequestResponseEndpoint
+from starlette.middleware.cors import CORSMiddleware
 
+from app.config import ConfigurationError, get_setting
+from app.database.repository import (
+    create_research_run,
+    fail_incomplete_research_runs,
+    get_research_run,
+    save_evidence,
+)
 from app.logging_utils import configure_app_logging, log_stage, request_id_context
 
 configure_app_logging()
 
 from app.agents.claim_drafter import ClaimDraftError, draft_claims
 from app.agents.planner import PlannerOutputError, create_research_plan
+from app.agents.report_writer import ResearchReportError
 from app.agents.researcher import ResearchProviderError, search_sources
 from app.agents.research_workflow import run_research
 from app.agents.verifier import ClaimVerificationError, verify_claims
-from app.config import ConfigurationError
-from app.database.repository import save_evidence
 from app.schemas.research import (
     ClaimDraftRequest,
     ClaimDraftResponse,
     ClaimVerificationRequest,
     ClaimVerificationResponse,
     ResearchPlan,
+    ResearchJobAccepted,
+    ResearchJobStatus,
     ResearchRunRequest,
     ResearchRunResponse,
     SearchRequest,
     SearchResponse,
 )
 from app.services.llm_client import LLMProviderError, ask_model
+from app.services.research_jobs import execute_research_job, new_research_run_id
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    fail_incomplete_research_runs()
+    yield
+
 
 app = FastAPI(
     title="DeepDive",
     description="A research system that verifies claims against cited source evidence.",
     version="0.1.0",
+    lifespan=lifespan,
+)
+allowed_frontend_origins = [
+    origin.strip()
+    for origin in get_setting(
+        "FRONTEND_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_frontend_origins,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 logger = logging.getLogger(__name__)
 
@@ -198,6 +232,59 @@ def run_research_request(request: ResearchRunRequest) -> ResearchRunResponse:
         ClaimVerificationError,
         LLMProviderError,
         PlannerOutputError,
+        ResearchReportError,
         ResearchProviderError,
     ) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/research/runs",
+    response_model=ResearchJobAccepted,
+    status_code=202,
+)
+def start_research_run(
+    request: ResearchRunRequest,
+    background_tasks: BackgroundTasks,
+) -> ResearchJobAccepted:
+    run_id = new_research_run_id()
+    try:
+        with log_stage(logger, "api.research.start_job"):
+            create_research_run(
+                run_id,
+                request.question,
+                request.results_per_query,
+            )
+    except Exception as exc:
+        logger.error(
+            "event=research_job_create_failed error_type=%s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create the research run.",
+        ) from exc
+
+    background_tasks.add_task(
+        execute_research_job,
+        run_id,
+        request.question,
+        request.results_per_query,
+    )
+    logger.info("event=research_job_queued run_id=%s", run_id)
+    return ResearchJobAccepted(
+        run_id=run_id,
+        status="queued",
+        status_url=f"/api/v1/research/runs/{run_id}",
+    )
+
+
+@app.get(
+    "/api/v1/research/runs/{run_id}",
+    response_model=ResearchJobStatus,
+)
+def get_research_run_status(run_id: str) -> ResearchJobStatus:
+    run = get_research_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Research run not found.")
+    return ResearchJobStatus.model_validate(run)

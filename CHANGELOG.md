@@ -53,3 +53,27 @@
   logging setup cannot silently suppress stage-start events. Logs now have
   timestamps and include a startup confirmation. Long LLM calls emit elapsed-
   time heartbeats every 15 seconds.
+- Added persisted background research jobs with stage progress, status polling,
+  completion results, and failure details. Jobs interrupted by an API process
+  restart are marked failed during startup.
+- Added a responsive React + TypeScript frontend for submitting research runs,
+  automatically polling job progress, and viewing plans, evidence, claims, and
+  verification verdicts. Added local Vite API proxy and FastAPI CORS settings.
+
+## 2026-10-14
+
+- Removed the internal research run ID from the visible frontend.
+- Replaced raw provider errors on research jobs with concise, actionable
+  messages, including specific guidance for provider quotas and credentials.
+- Prevented the frontend from displaying raw API error response details.
+- Moved the existing DM Sans, Manrope, and DM Mono font loading to the HTML
+  document head with preconnect hints.
+- Documented that the frontend can remain in the backend repository while
+  deploying independently as a static site.
+- Added OpenRouter as an optional OpenAI-compatible LLM provider, configurable
+  with its own API key and model slug.
+- Added a final report-writing stage that synthesizes verified claims and cited
+  passages into a research answer, validating every report citation.
+- Updated the frontend to show the synthesized answer first and put the
+  research plan, snippets, and claim checks inside a collapsed audit trail.
+- Increased body and research-result typography for readability.
